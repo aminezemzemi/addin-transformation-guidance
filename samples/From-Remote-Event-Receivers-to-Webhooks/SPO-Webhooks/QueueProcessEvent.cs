@@ -14,10 +14,12 @@ namespace PnP.SPO.Webhooks
         private readonly AzureFunctionSettings _settings;
         private readonly BlobServiceClient _blobServiceClient;
 
-        public QueueProcessEvent(IPnPContextFactory pnpContextFactory,
+        public QueueProcessEvent(
+            IPnPContextFactory pnpContextFactory,
             AzureFunctionSettings settings,
             BlobServiceClient blobServiceClient,
-            ILoggerFactory loggerFactory)
+            ILoggerFactory loggerFactory
+        )
         {
             _pnpContextFactory = pnpContextFactory;
             _settings = settings;
@@ -26,71 +28,111 @@ namespace PnP.SPO.Webhooks
         }
 
         [Function("QueueProcessEvent")]
-        public async Task Run([QueueTrigger("spo-webhooks", Connection = "AzureStorage")] string queueMessage)
+        public async Task Run(
+            [QueueTrigger("spo-webhooks", Connection = "AzureStorage")] string queueMessage
+        )
         {
             if (!string.IsNullOrEmpty(queueMessage))
             {
-                var notification = System.Text.Json.JsonSerializer.Deserialize<WebhookNotificationEvent>(queueMessage, 
-                    new System.Text.Json.JsonSerializerOptions {
-                        PropertyNameCaseInsensitive = true
-                    });
-                
+                var notification =
+                    System.Text.Json.JsonSerializer.Deserialize<WebhookNotificationEvent>(
+                        queueMessage,
+                        new System.Text.Json.JsonSerializerOptions
+                        {
+                            PropertyNameCaseInsensitive = true
+                        }
+                    );
+
                 if (notification != null)
                 {
-                    _logger.LogInformation($"Notification for resource {notification.Resource} on site {notification.SiteUrl} for tenant {notification.TenantId}");
+                    _logger.LogInformation(
+                        $"Notification for resource {notification.Resource} on site {notification.SiteUrl} for tenant {notification.TenantId}"
+                    );
 
-                    using (var pnpContext = await _pnpContextFactory.CreateAsync(
-                        new Uri($"https://{_settings.TenantName}/{notification.SiteUrl}"), 
-                        CancellationToken.None))
+                    using (
+                        var pnpContext = await _pnpContextFactory.CreateAsync(
+                            new Uri($"https://{_settings.TenantName}/{notification.SiteUrl}"),
+                            CancellationToken.None
+                        )
+                    )
                     {
                         pnpContext.GraphFirst = false;
 
-                        // Define a query for the last 100 changes happened, regardless the type of change (add, update, delete). Here code still does not provide the ChangeToken 
-                        var changeQuery = new PnP.Core.Model.SharePoint.ChangeQueryOptions(false, true) {
-                            Item = true,                                   
-                            FetchLimit = 100,
+                        // Define a query for the last 100 changes happened, regardless the type of change (add, update, delete). Here code still does not provide the ChangeToken
+                        var changeQuery = new PnP.Core.Model.SharePoint.ChangeQueryOptions(
+                            false,
+                            true
+                        )
+                        {
+                            Item = true,
+                            //FetchLimit = 100,
+                            //Default FetchLimit is 1000, We will read changes 1000 per 1000 until changes.count equals to 0
                         };
 
-                        var lastChangeToken = await GetLatestChangeTokenAsync();
-                        if (lastChangeToken != null) {
-                            changeQuery.ChangeTokenStart = new ChangeTokenOptions(lastChangeToken);
-                        }
-
-                        // Use GetChanges against the list with ID notification.Resource, which is the target list
-                        var targetList = pnpContext.Web.Lists.GetById(Guid.Parse(notification.Resource));
-                        var changes = await targetList.GetChangesAsync(changeQuery);
-
-                        // Save the last change token
-                        await SaveLatestChangeTokenAsync(changes.Last().ChangeToken);
-
-                        // Process all the retrieved changes
-                        foreach (var change in changes)
+                        bool stopChanges = false;
+                        do
                         {
-                            _logger.LogInformation(change.GetType().FullName);
-
-                            // Try to see if the current change is an IChangeItem
-                            // meaning that it is a change that occurred on an item
-                            if (change is IChangeItem changeItem)
+                            var lastChangeToken = await GetLatestChangeTokenAsync();
+                            if (lastChangeToken != null)
                             {
-                                // Get the date and time when the change happened
-                                DateTime changeTime = changeItem.Time;
-                                
-                                // Check if we have the ID of the target item
-                                if (changeItem.IsPropertyAvailable<IChangeItem>(i => i.ItemId))
+                                changeQuery.ChangeTokenStart = new ChangeTokenOptions(
+                                    lastChangeToken
+                                );
+                            }
+
+                            // Use GetChanges against the list with ID notification.Resource, which is the target list
+                            var targetList = pnpContext.Web.Lists.GetById(
+                                Guid.Parse(notification.Resource)
+                            );
+                            var changes = await targetList.GetChangesAsync(changeQuery);
+
+                            //If fire exception sometimes when we didn't make a test
+                            if (changes.Count > 0)
+                            {
+                                lastChangeToken = changes.Last().ChangeToken.StringValue;
+
+                                // Process all the retrieved changes
+                                foreach (var change in changes)
                                 {
-                                    var itemId = changeItem.ItemId;
+                                    _logger.LogInformation(change.GetType().FullName);
 
-                                    // If that is the case, retrieve the item
-                                    var targetItem = targetList.Items.GetById(itemId);
-
-                                    if (targetItem != null)
+                                    // Try to see if the current change is an IChangeItem
+                                    // meaning that it is a change that occurred on an item
+                                    if (change is IChangeItem changeItem)
                                     {
-                                        // And log some information, just for the sake of making an example
-                                        _logger.LogInformation($"Processing changes for item '{targetItem.Title}' happened on {changeTime}");
+                                        // Get the date and time when the change happened
+                                        DateTime changeTime = changeItem.Time;
+
+                                        // Check if we have the ID of the target item
+                                        if (
+                                            changeItem.IsPropertyAvailable<IChangeItem>(i =>
+                                                i.ItemId
+                                            )
+                                        )
+                                        {
+                                            var itemId = changeItem.ItemId;
+
+                                            // If that is the case, retrieve the item
+                                            var targetItem = targetList.Items.GetById(itemId);
+
+                                            if (targetItem != null)
+                                            {
+                                                // And log some information, just for the sake of making an example
+                                                _logger.LogInformation(
+                                                    $"Processing changes for item '{targetItem.Title}' happened on {changeTime}"
+                                                );
+                                            }
+                                        }
                                     }
-                                }      
-                            } 
-                        }
+                                }
+                            }
+                            else if (changes.Count == 0)
+                            {
+                                // Save the last change token
+                                await SaveLatestChangeTokenAsync(changeQuery.ChangeTokenStart);
+                                stopChanges = true;
+                            }
+                        } while (stopChanges == false);
                     }
                 }
             }
@@ -100,9 +142,9 @@ namespace PnP.SPO.Webhooks
         {
             // Get a reference to the Azure Storage Container
             var container = _blobServiceClient.GetBlobContainerClient("spo-webhooks-storage");
-            
+
             // Browse the files (there should be just one, if any)
-            await foreach(var blob in container.GetBlobsAsync())
+            await foreach (var blob in container.GetBlobsAsync())
             {
                 // If the file is the one we're looking for
                 if (blob.Name == "ChangeToken.txt")
@@ -120,7 +162,7 @@ namespace PnP.SPO.Webhooks
         }
 
         private async Task SaveLatestChangeTokenAsync(IChangeToken changeToken)
-        {            
+        {
             // Get a reference to the Azure Storage Container
             var container = _blobServiceClient.GetBlobContainerClient("spo-webhooks-storage");
 
@@ -134,7 +176,7 @@ namespace PnP.SPO.Webhooks
                 {
                     sw.WriteLine(changeToken.StringValue);
                     await sw.FlushAsync();
-                    
+
                     mem.Position = 0;
 
                     // Upload it into the target blob
